@@ -75,6 +75,43 @@ int pcap_set_rfmon(pcap_t *p, int rfmon) {
 }
 #endif
 
+#ifdef __linux__
+#define _GNU_SOURCE
+#define __USE_GNU
+#include <sched.h>
+#include <linux/sched.h>
+#include <string.h>
+
+pcap_t *ns_pcap_open_live(int curns, int newns, const char *device,
+                          int snaplen, int promisc, int to_ms, char *errbuf) {
+	pcap_t *pcap = NULL;
+	int errno = 0;
+
+	errno = setns(newns, CLONE_NEWNET);
+	if (errno) {
+		if (errbuf != NULL) {
+			strerror_r(errno, errbuf, PCAP_ERRBUF_SIZE);
+		}
+		return NULL;
+	}
+
+	pcap = pcap_open_live(device, snaplen, promisc, to_ms, errbuf);
+
+	errno = setns(curns, CLONE_NEWNET);
+	if (errno) {
+		if (errbuf != NULL) {
+			strerror_r(errno, errbuf, PCAP_ERRBUF_SIZE);
+		}
+		if (pcap != NULL) {
+			pcap_close(pcap);
+		}
+		return NULL;
+	}
+
+	return pcap;
+}
+#endif
+
 // Windows, Macs, and Linux all use different time types.  Joy.
 #ifdef WIN32
 #define gopacket_time_secs_t long
@@ -97,6 +134,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"reflect"
 	"runtime"
 	"strconv"
@@ -231,6 +269,47 @@ func OpenLive(device string, snaplen int32, promisc bool, timeout time.Duration)
 	defer C.free(unsafe.Pointer(dev))
 
 	p.cptr = C.pcap_open_live(dev, C.int(snaplen), pro, timeoutMillis(timeout), buf)
+	if p.cptr == nil {
+		return nil, errors.New(C.GoString(buf))
+	}
+	return p, nil
+}
+
+func getCurrentNamespace() (int, error) {
+	curnsPath := fmt.Sprintf("/proc/%d/task/%d/ns/net", os.Getpid(), syscall.Gettid())
+	return syscall.Open(curnsPath, syscall.O_RDONLY, 0)
+}
+
+// OpenLiveInNamespace opens a device inside a network namespace and returns a
+// *Handle. It takes as arguments the file descriptor of the new namespace, the
+// name of the device ("eth0"), the maximum size to / read for
+// each packet (snaplen), whether to put the interface in promiscuous mode,
+// and a timeout.
+// OpenLiveInNamespace switches to the new namespace, opens the device
+// then switches back to the original namespace.
+//
+// See the package documentation for important details regarding 'timeout'.
+func OpenLiveInNamespace(newns int, device string, snaplen int32, promisc bool, timeout time.Duration) (handle *Handle, _ error) {
+	curns, err := getCurrentNamespace()
+	if err != nil {
+		return nil, err
+	}
+	defer syscall.Close(curns)
+
+	buf := (*C.char)(C.calloc(errorBufferSize, 1))
+	defer C.free(unsafe.Pointer(buf))
+	var pro C.int
+	if promisc {
+		pro = 1
+	}
+	p := &Handle{}
+	p.blockForever = timeout < 0
+	p.device = device
+
+	dev := C.CString(device)
+	defer C.free(unsafe.Pointer(dev))
+
+	p.cptr = C.ns_pcap_open_live(C.int(curns), C.int(newns), dev, C.int(snaplen), pro, timeoutMillis(timeout), buf)
 	if p.cptr == nil {
 		return nil, errors.New(C.GoString(buf))
 	}
